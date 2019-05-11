@@ -1,0 +1,181 @@
+!ls -l $SPARK_HOME
+# Note: set SPARK_HOME to Spark binaries before launching the Jupyter session.
+import os, sys
+SPARK_HOME = os.environ['SPARK_HOME']
+sys.path.insert(0, os.path.join(SPARK_HOME, "python", "lib", "py4j-0.10.4-src.zip"))
+sys.path.insert(0, os.path.join(SPARK_HOME, "python"))
+
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.getOrCreate()
+print("Spark version: ", spark.version)
+
+spark.sparkContext.uiWebUrl
+
+Import libararies
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml.pipeline import Pipeline
+
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml import evaluation
+from pyspark.sql.functions import * 
+
+import pandas as pd
+import pyspark
+import numpy as np
+
+pd.__version__, np.__version__,pyspark.__version__
+
+Load Dataset
+
+credit = spark.read.options(header = True, inferSchema = True).csv("/data/credit-default.csv").cache()
+print("Total number of records: ", credit.count())
+credit.limit(10).toPandas().head() 
+# Taking 10 samples records from spark dtaframe into a Pandas dataframe to display the values
+# I prefer the pandas dataframe display to that by spark dataframe show function.
+
+credit.printSchema()
+
+cols = credit.columns
+cols.remove("default")
+cols
+
+
+from pyspark.ml import Model, Estimator class DFOneHotEncoderModel(Model): def get_col_labels(self): cols = [] feature_columns = [c for c in self.columns if not c == self.label_column] for col in feature_columns: if col in self.categorical_fields: string_indexer, _ = self.categorical_fields[col] values = string_indexer.labels values = values[:-1] if self.drop_last else values values = [col + "_" + v for v in values] cols.extend(values) else: cols.append(col) return cols def transform(self, df, params= None): for colname in self.categorical_fields: string_indexer, one_hot_encoder = self.categorical_fields[colname] df = string_indexer.transform(df) df = df.drop(colname) df = df.withColumnRenamed(colname + "_idx", colname) if one_hot_encoder: df = one_hot_encoder.transform(df) df = df.drop(colname) df = df.withColumnRenamed(colname + "_ohe", colname) return df class DFOneHotEncoder(Estimator): def __init__(self, label_column, categorical_fields= None, one_hot = True, drop_last = True): self.categorical_fields = None self.one_hot = one_hot self.drop_last = drop_last self.label_column = label_column if not categorical_fields is None: self.categorical_fields = dict([(c, None) for c in categorical_fields]) def fit(self, df): cols = df.columns if self.categorical_fields is None: self.categorical_fields = dict([(col, None) for col, dtype in df.dtypes if dtype == "string"]) for colname in self.categorical_fields: string_indexer = StringIndexer(inputCol=colname, outputCol= colname + "_idx").fit(df) one_hot_encoder = None if self.one_hot: one_hot_encoder = OneHotEncoder(inputCol=colname , outputCol=colname + "_ohe" , dropLast = self.drop_last) self.categorical_fields[colname] = (string_indexer, one_hot_encoder) model = DFOneHotEncoderModel() model.categorical_fields = self.categorical_fields model.one_hot = self.one_hot model.drop_last = self.drop_last model.columns = cols model.label_column = self.label_column return model
+
+model = DFOneHotEncoder(label_column = "default").fit(credit)
+df = model.transform(credit)
+print(df.dtypes)
+print("\n")
+print(model.get_col_labels())
+
+df.printSchema()
+
+df_vect = VectorAssembler(inputCols = cols, outputCol="features").transform(df)
+df_vect.select("features", "default").limit(5).toPandas()
+
+credit.first()
+
+pd.DataFrame({"feature": model.get_col_labels(), "value": df_vect.select("features").first().features})
+
+df_train, df_test = df_vect.randomSplit(weights=[0.7, 0.3], seed=1)
+df_train.count(), df_test.count()
+
+Build a RandomForest Classifier
+
+forest = RandomForestClassifier(labelCol="default", featuresCol="features", seed = 123)
+forest_model = forest.fit(df_train)
+
+Run prediction on the whole dataset
+
+df_test_pred = forest_model.transform(df_test)
+df_test_pred.show(5)
+
+Confusion Matrix
+
+df_test_pred.groupBy("default").pivot("prediction").count().show()
+
++-------+---+---+
+|default|1.0|2.0|
++-------+---+---+
+|      1|197| 14|
+|      2| 67| 18|
++-------+---+---+
+
+
+Evaluate
+evaluator = evaluation.MulticlassClassificationEvaluator(labelCol="default", 
+                                        metricName="accuracy", predictionCol="prediction")
+evaluator.evaluate(df_test_pred)
+
+Out: 0.7263513513513513
+
+print("Total number of features: ", forest_model.numFeatures, "\nOrder of feature importance: \n")
+pd.DataFrame({"importance": forest_model.featureImportances.toArray(), 
+              "feature": model.get_col_labels()
+             }).sort_values("importance", ascending = False)
+
+Out : Total number of features:  48 
+
+Order of feature importance: 
+Out:
+feature	importance
+0	checking_balance_unknown	0.137719
+17	amount	0.108318
+3	months_loan_duration	0.107306
+1	checking_balance_< 0 DM	0.084107
+5	credit_history_critical	0.050758
+36	age	0.037456
+19	savings_balance_unknown	0.034928
+2	checking_balance_1 - 200 DM	0.033914
+32	residence_history	0.028649
+9	purpose_car (new)	0.027793
+38	installment_plan_bank	0.024021
+27	personal_status_single male	0.020772
+34	property_real estate	0.019711
+40	housing_rent	0.019111
+41	existing_credits	0.017382
+37	installment_plan_none	0.016538
+26	installment_rate	0.016347
+7	credit_history_fully repaid this bank	0.015123
+20	savings_balance_101 - 500 DM	0.014589
+47	job_mangement self-employed	0.013875
+39	housing_own	0.012741
+25	employment_length_0 - 1 yrs	0.010733
+43	telephone_none	0.010121
+18	savings_balance_< 100 DM	0.009821
+28	personal_status_female	0.009779
+21	savings_balance_501 - 1000 DM	0.009693
+31	other_debtors_guarantor	0.009417
+33	property_other	0.008785
+30	other_debtors_none	0.007644
+10	purpose_furniture	0.007480
+13	purpose_education	0.006903
+46	job_unskilled resident	0.006763
+24	employment_length_4 - 7 yrs	0.006574
+4	credit_history_repaid	0.005442
+45	job_skilled employee	0.004831
+6	credit_history_delayed	0.004603
+11	purpose_car (used)	0.004378
+15	purpose_others	0.004144
+22	employment_length_1 - 4 yrs	0.004059
+29	personal_status_married male	0.003893
+8	purpose_radio/tv	0.003618
+35	property_building society savings	0.003350
+12	purpose_business	0.003306
+42	dependents	0.003301
+14	purpose_repairs	0.002724
+23	employment_length_> 7 yrs	0.002723
+44	foreign_worker_yes	0.002495
+16	purpose_domestic appliances	0.002262
+
+Building a pipeline
+
+
+from pyspark.ml.pipeline import Pipeline, PipelineModel
+
+credit = spark.read.options(header = True, inferSchema = True).csv("/data/credit-default.csv").cache()
+
+label_col = "default"
+feature_cols = credit.columns
+feature_cols.remove(label_col)
+
+df_train, df_test = credit.randomSplit(weights=[0.7, 0.3], seed=1)
+
+
+pipeline = Pipeline()
+print(pipeline.explainParams())
+encoder = DFOneHotEncoder(label_column = label_col)
+vectorizer = VectorAssembler(inputCols = feature_cols, outputCol="features")
+forest = RandomForestClassifier(labelCol="default", featuresCol="features", seed = 123)
+
+pipeline.setStages([encoder, vectorizer, forest])
+pipelineModel = pipeline.fit(df_train)
+df_test_pred = pipelineModel.transform(df_test)
+evaluator = evaluation.MulticlassClassificationEvaluator(labelCol="default", 
+                                        metricName="accuracy", predictionCol="prediction")
+
+accuracy = evaluator.evaluate(df_test_pred)
+print("Accuracy", accuracy)
+stages: a list of pipeline stages (undefined)
+
+Out : Accuracy 0.7601351351351351
